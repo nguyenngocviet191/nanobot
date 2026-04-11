@@ -9,6 +9,9 @@ from pathlib import Path
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
+# Global skills directory (user home)
+GLOBAL_SKILLS_DIR = Path.home() / ".agents" / "skills"
+
 # Opening ---, YAML body (group 1), closing --- on its own line; supports CRLF.
 _STRIP_SKILL_FRONTMATTER = re.compile(
     r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n?",
@@ -28,10 +31,11 @@ class SkillsLoader:
     specific tools or perform certain tasks.
     """
 
-    def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None):
+    def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None, global_skills_dir: Path | None = None):
         self.workspace = workspace
         self.workspace_skills = workspace / "skills"
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
+        self.global_skills = global_skills_dir or GLOBAL_SKILLS_DIR
 
     def _skill_entries_from_dir(self, base: Path, source: str, *, skip_names: set[str] | None = None) -> list[dict[str, str]]:
         if not base.exists():
@@ -59,11 +63,21 @@ class SkillsLoader:
         Returns:
             List of skill info dicts with 'name', 'path', 'source'.
         """
+        # Priority 1: Workspace skills (highest priority - project-specific)
         skills = self._skill_entries_from_dir(self.workspace_skills, "workspace")
         workspace_names = {entry["name"] for entry in skills}
+        
+        # Priority 2: Builtin skills
         if self.builtin_skills and self.builtin_skills.exists():
             skills.extend(
                 self._skill_entries_from_dir(self.builtin_skills, "builtin", skip_names=workspace_names)
+            )
+        builtin_names = {entry["name"] for entry in skills}
+        
+        # Priority 3: Global skills (lowest priority - fallback)
+        if self.global_skills and self.global_skills.exists():
+            skills.extend(
+                self._skill_entries_from_dir(self.global_skills, "global", skip_names=builtin_names)
             )
 
         if filter_unavailable:
@@ -80,9 +94,12 @@ class SkillsLoader:
         Returns:
             Skill content or None if not found.
         """
+        # Priority order: workspace -> builtin -> global
         roots = [self.workspace_skills]
         if self.builtin_skills:
             roots.append(self.builtin_skills)
+        if self.global_skills:
+            roots.append(self.global_skills)
         for root in roots:
             path = root / name / "SKILL.md"
             if path.exists():
