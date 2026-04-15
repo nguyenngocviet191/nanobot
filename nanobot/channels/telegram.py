@@ -11,9 +11,9 @@ from typing import Any, Literal
 
 from loguru import logger
 from pydantic import Field
-from telegram import BotCommand, ReactionTypeEmoji, ReplyParameters, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, ReplyParameters, Update
 from telegram.error import BadRequest, NetworkError, TimedOut
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
@@ -216,6 +216,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("dream_log", "Show the latest Dream memory change"),
         BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
         BotCommand("help", "Show available commands"),
+        BotCommand("models", "Switch AI model for this session"),
     ]
 
     @classmethod
@@ -317,6 +318,17 @@ class TelegramChannel(BaseChannel):
             )
         )
         self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
+
+        # /models command handler - show provider/model selection inline keyboard
+        self._app.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/models(?:@\w+)?(?:\s+.*)?$"),
+                self._on_models_command,
+            )
+        )
+
+        # Callback query handler for inline button clicks
+        self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
 
         # Custom commands handler - catches slash commands not handled above
         self._app.add_handler(
@@ -1113,6 +1125,255 @@ User args: {args}"""
             logger.warning("Telegram network issue: {}", summary)
         else:
             logger.error("Telegram error: {}", summary)
+
+    # === /models command implementation ===
+
+    DEFAULT_PROVIDER_MODELS = {
+        "anthropic": [
+            "claude-3-5-sonnet-20241022",
+            "claude-3-opus-20240229",
+            "claude-3-haiku-20240307",
+        ],
+        "openai": [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4-turbo",
+        ],
+        "deepseek": [
+            "deepseek-chat",
+            "deepseek-coder",
+        ],
+        "gemini": [
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+        ],
+        "openrouter": [],  # Must fetch dynamically
+        "moonshot": [
+            "moonshot-v1-8k",
+            "moonshot-v1-32k",
+            "kimi-k2.5",
+        ],
+        "zhipu": [
+            "glm-4",
+            "glm-4-flash",
+        ],
+        "dashscope": [
+            "qwen-turbo",
+            "qwen-plus",
+            "qwen-max",
+        ],
+        "deepseek": [
+            "deepseek-chat",
+            "deepseek-coder",
+        ],
+    }
+
+    async def _on_models_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /models command - show provider selection inline keyboard."""
+        if not update.message:
+            return
+
+        providers = self._get_configured_providers()
+
+        if not providers:
+            await update.message.reply_text("⚠️ No providers configured.")
+            return
+
+        # Build provider buttons (one per row for simplicity)
+        buttons = [
+            [InlineKeyboardButton(p["label"], callback_data=f"mdl:prov:{p['name']}")]
+            for p in providers
+        ]
+
+        keyboard = InlineKeyboardMarkup(buttons)
+        await update.message.reply_text(
+            "🤖 *Select AI Provider*\n\nTap a provider to see available models:",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
+    async def _on_callback_query(self, update: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline button callback queries for /models flow."""
+        query = update.callback_query
+        if query is None:
+            return
+
+        await query.answer()
+
+        data = query.data or ""
+        chat_id = str(query.message.chat_id) if query.message else ""
+        message_id = query.message.message_id if query.message else None
+
+        if data.startswith("mdl:prov:"):
+            # Provider selected → show models
+            provider_name = data.split(":", 2)[2]
+            models = await self._get_models_for_provider(provider_name)
+
+            if not models:
+                if query.message:
+                    await query.edit_message_text("⚠️ No models available for this provider.")
+                return
+
+            # Build model buttons
+            buttons = [
+                [InlineKeyboardButton(m, callback_data=f"mdl:model:{provider_name}:{m}")]
+                for m in models
+            ]
+            buttons.append([
+                InlineKeyboardButton("← Back", callback_data="mdl:back:providers")
+            ])
+
+            keyboard = InlineKeyboardMarkup(buttons)
+            if query.message:
+                await query.edit_message_text(
+                    f"🤖 *Select Model for {provider_name}*\n\nTap to select:",
+                    parse_mode="Markdown",
+                    reply_markup=keyboard,
+                )
+
+        elif data.startswith("mdl:model:"):
+            # Model selected → apply and show indicator
+            parts = data.split(":", 3)
+            if len(parts) >= 4:
+                provider_name = parts[2]
+                model_name = parts[3]
+                model_full = f"{provider_name}/{model_name}"
+
+                # Store in session
+                await self._apply_model_to_session(chat_id, model_full)
+
+                # Update message to indicator
+                if query.message:
+                    await query.edit_message_text(f"🤖 Using: {model_full}")
+
+        elif data == "mdl:back:providers":
+            # Back to provider list
+            providers = self._get_configured_providers()
+            if not providers:
+                if query.message:
+                    await query.edit_message_text("⚠️ No providers configured.")
+                return
+
+            buttons = [
+                [InlineKeyboardButton(p["label"], callback_data=f"mdl:prov:{p['name']}")]
+                for p in providers
+            ]
+            keyboard = InlineKeyboardMarkup(buttons)
+
+            if query.message:
+                await query.edit_message_text(
+                    "🤖 *Select AI Provider*\n\nTap a provider to see available models:",
+                    parse_mode="Markdown",
+                    reply_markup=keyboard,
+                )
+
+    def _get_configured_providers(self) -> list[dict]:
+        """Get providers that have API key configured."""
+        from nanobot.providers.registry import PROVIDERS
+
+        providers = []
+        # Access config via AgentLoop if available, otherwise load from default path
+        config = self._get_config()
+        if not config:
+            return []
+
+        for spec in PROVIDERS:
+            provider_config = getattr(config.providers, spec.name, None)
+            if provider_config and provider_config.api_key:
+                providers.append({
+                    "name": spec.name,
+                    "label": spec.label,
+                    "api_key": provider_config.api_key,
+                    "api_base": provider_config.api_base or spec.default_api_base or "",
+                    "config": provider_config,
+                })
+        return providers
+
+    def _get_config(self) -> Any:
+        """Get the global config instance."""
+        from nanobot.config.loader import load_config
+        return load_config()
+
+    async def _get_models_for_provider(self, provider_name: str) -> list[str]:
+        """Get available models for a provider with priority: config > API > defaults."""
+        from nanobot.providers.registry import find_by_name
+
+        config = self._get_config()
+
+        # Try to get provider config if config is available
+        provider_config = None
+        if config:
+            provider_config = getattr(config.providers, provider_name, None)
+
+        # If no provider_config found, fallback to defaults
+        if not provider_config:
+            return self.DEFAULT_PROVIDER_MODELS.get(provider_name, [])
+
+        # 1. Check explicit config models list
+        if provider_config.models:
+            return provider_config.models
+
+        # 2. Try fetch from /v1/models API
+        # Resolve effective api_base using registry default as fallback
+        spec = find_by_name(provider_name)
+        effective_api_base = provider_config.api_base or (spec.default_api_base if spec else None)
+        if provider_config.api_key and effective_api_base:
+            fetched = await self._fetch_models_from_api(provider_config, effective_api_base)
+            if fetched:
+                return fetched
+
+        # 3. Fallback to hardcoded defaults
+        return self.DEFAULT_PROVIDER_MODELS.get(provider_name, [])
+
+    async def _fetch_models_from_api(self, provider_config, effective_api_base: str) -> list[str]:
+        """Try to fetch model list from provider's /v1/models endpoint."""
+        if not effective_api_base:
+            return []
+
+        try:
+            import httpx
+
+            # Normalize api_base: ensure it ends with /v1 or /v1/
+            normalized_base = effective_api_base.rstrip("/")
+            if not normalized_base.endswith("/v1"):
+                normalized_base = f"{normalized_base}/v1"
+
+            async with httpx.AsyncClient() as client:
+                headers = {"Authorization": f"Bearer {provider_config.api_key}"}
+                if provider_config.extra_headers:
+                    headers.update(provider_config.extra_headers)
+
+                response = await client.get(
+                    f"{normalized_base}/models",
+                    headers=headers,
+                    timeout=5.0,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    # Handle OpenAI-compatible response format: {"data": [{"id": "model-id", ...}]}
+                    if "data" in data:
+                        return [m["id"] for m in data.get("data", [])]
+                    # Handle alternative format: {"models": [{"id": "model-id", ...}]}
+                    if "models" in data:
+                        return [m["id"] for m in data.get("models", [])]
+        except Exception as e:
+            logger.debug("Failed to fetch models from {}: {}", effective_api_base, e)
+        return []
+
+    async def _apply_model_to_session(self, chat_id: str, model_full: str) -> None:
+        """Store selected model in session metadata."""
+        from nanobot.session.manager import SessionManager
+        from nanobot.config.paths import get_workspace_path
+
+        session_key = f"telegram:{chat_id}"
+        workspace = get_workspace_path()
+        session_mgr = SessionManager(workspace)
+        session = session_mgr.get_or_create(session_key)
+
+        session.metadata["temp_model"] = model_full
+        session_mgr.save(session)
+
+        logger.info("Session {} temp model set to {}", session_key, model_full)
 
     def _get_extension(
         self,

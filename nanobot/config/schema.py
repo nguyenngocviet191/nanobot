@@ -98,6 +98,7 @@ class ProviderConfig(Base):
     api_key: str = ""
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+    models: list[str] = Field(default_factory=list)  # Explicit model list override for /models command
 
 
 class ProvidersConfig(Base):
