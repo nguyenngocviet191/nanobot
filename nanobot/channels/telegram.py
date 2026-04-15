@@ -20,7 +20,8 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.command.builtin import build_help_text
-from nanobot.config.paths import get_media_dir
+from nanobot.command.custom_commands import CustomCommandsLoader
+from nanobot.config.paths import get_media_dir, get_workspace_path
 from nanobot.config.schema import Base
 from nanobot.security.network import validate_url_target
 from nanobot.utils.helpers import split_message
@@ -235,6 +236,7 @@ class TelegramChannel(BaseChannel):
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
+        self._custom_commands = CustomCommandsLoader(get_workspace_path())
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -316,6 +318,14 @@ class TelegramChannel(BaseChannel):
         )
         self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
 
+        # Custom commands handler - catches slash commands not handled above
+        self._app.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/[a-zA-Z0-9_]+(?:\s+.*)?$"),
+                self._on_custom_command,
+            )
+        )
+
         # Add message handler for text, photos, voice, documents, and locations
         self._app.add_handler(
             MessageHandler(
@@ -338,7 +348,7 @@ class TelegramChannel(BaseChannel):
         logger.info("Telegram bot @{} connected", bot_info.username)
 
         try:
-            await self._app.bot.set_my_commands(self.BOT_COMMANDS)
+            await self._app.bot.set_my_commands(self._get_all_bot_commands())
             logger.debug("Telegram bot commands registered")
         except Exception as e:
             logger.warning("Failed to register bot commands: {}", e)
@@ -652,6 +662,21 @@ class TelegramChannel(BaseChannel):
             return
         await update.message.reply_text(build_help_text())
 
+    def _get_all_bot_commands(self) -> list[BotCommand]:
+        """Combine built-in BOT_COMMANDS with custom commands from workspace."""
+        # Built-in commands
+        commands = list(self.BOT_COMMANDS)
+
+        # Add custom commands from workspace/commands/
+        for cmd in self._custom_commands.get_bot_commands():
+            # Skip if command name already exists in built-in
+            if any(c.command == cmd["command"] for c in commands):
+                continue
+            commands.append(BotCommand(cmd["command"], cmd["description"]))
+
+        # Telegram limit: max 100 commands
+        return commands[:100]
+
     @staticmethod
     def _sender_id(user) -> str:
         """Build sender_id with username for allowlist matching."""
@@ -853,6 +878,47 @@ class TelegramChannel(BaseChannel):
             sender_id=self._sender_id(user),
             chat_id=str(message.chat_id),
             content=content,
+            metadata=self._build_message_metadata(message, user),
+            session_key=self._derive_topic_session_key(message),
+        )
+
+    async def _on_custom_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle custom slash commands from workspace/commands/"""
+        if not update.message or not update.effective_user:
+            return
+
+        message = update.message
+        content = message.text or ""
+
+        # Only handle if it looks like a command
+        if not content.startswith("/"):
+            return
+
+        # Extract command name
+        parts = content.strip("/").split()
+        cmd_name = parts[0].lower()
+
+        # Check if it's a custom command
+        cmd_content = self._custom_commands.get_command_content(cmd_name)
+        if cmd_content is None:
+            return  # Not a custom command, let other handlers try
+
+        # It's a custom command - forward to agent
+        user = update.effective_user
+        self._remember_thread_context(message)
+
+        # Build instruction with command content and args
+        args = " ".join(parts[1:]) if len(parts) > 1 else ""
+        instruction = f"""Execute this command:
+
+{cmd_content}
+
+User args: {args}"""
+
+        await self._handle_message(
+            sender_id=self._sender_id(user),
+            chat_id=str(message.chat_id),
+            content=instruction,
             metadata=self._build_message_metadata(message, user),
             session_key=self._derive_topic_session_key(message),
         )
