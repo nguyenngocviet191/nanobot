@@ -324,6 +324,7 @@ def build_help_text() -> str:
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
+        "/models — Switch AI model for this session",
         "/help — Show available commands",
     ]
     return "\n".join(lines)

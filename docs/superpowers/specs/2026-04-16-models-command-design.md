@@ -1,5 +1,7 @@
 # Feature: `/models` Command - Inline Model Selection
 
+## Status: ✅ Implemented
+
 ## Context
 
 User wants a `/models` slash command that shows inline buttons to select AI provider and model for the current session. The selection should be temporary (session-only) and display an indicator after selection.
@@ -177,6 +179,20 @@ class TelegramChannel(BaseChannel):
         # Add callback query handler for inline buttons
         self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
 ```
+
+### 1b. Important: Enable callback_query in polling
+
+**File:** `nanobot/channels/telegram.py`
+
+```python
+await self._app.updater.start_polling(
+    allowed_updates=["message", "callback_query"],  # Must include "callback_query"
+    drop_pending_updates=False,
+    error_callback=self._on_polling_error,
+)
+```
+
+⚠️ **Note:** Without `"callback_query"` in `allowed_updates`, inline button clicks will NOT trigger the callback handler.
 
 ### 2. Provider Listing
 

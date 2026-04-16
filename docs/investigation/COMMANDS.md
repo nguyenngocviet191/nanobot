@@ -179,6 +179,10 @@ async def dispatch(self, ctx: CommandContext) -> OutboundMessage | None:
 | `/restart` | Priority | Restart agent |
 | `/clear` | Exact | Xóa session history |
 | `/status` | Exact | Hiển thị trạng thái |
+| `/models` | Channel-specific | Chọn AI provider/model qua inline buttons |
+| `/dream` | Exact | Trigger Dream memory consolidation |
+| `/dream-log` | Prefix | Xem thay đổi của Dream |
+| `/dream-restore` | Prefix | Khôi phục memory về phiên bản trước |
 | `/team` | Prefix | Team mode commands |
 | `/skill` | Prefix | Skill management |
 | `/cron` | Prefix | Cron commands |
