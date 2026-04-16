@@ -571,8 +571,13 @@ class TelegramChannel(BaseChannel):
 
         if meta.get("_stream_end"):
             buf = self._stream_bufs.get(chat_id)
-            if not buf or not buf.message_id or not buf.text:
+            if not buf or not buf.message_id:
                 return
+            # _append_footer means delta is the usage footer to append, not replace
+            if meta.get("_append_footer"):
+                buf.text = (buf.text or "") + delta
+            else:
+                buf.text = delta if delta else buf.text
             if stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id:
                 return
             self._stop_typing(chat_id)

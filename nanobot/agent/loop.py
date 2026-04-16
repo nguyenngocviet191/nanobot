@@ -182,6 +182,7 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
+        self._last_usage_footer: str = ""
         self._extra_hooks: list[AgentHook] = hooks or []
 
         self.context = ContextBuilder(workspace, timezone=timezone)
@@ -329,6 +330,11 @@ class AgentLoop:
         if self._unified_session and not msg.session_key_override:
             return UNIFIED_SESSION_KEY
         return msg.session_key
+
+    @property
+    def last_usage(self) -> dict[str, int]:
+        """Return the most recent LLM usage dict (prompt_tokens, completion_tokens, cached_tokens, ...)."""
+        return self._last_usage
 
     async def _run_agent_loop(
         self,
@@ -529,7 +535,7 @@ class AgentLoop:
                             meta["_stream_id"] = _current_stream_id()
                             await self.bus.publish_outbound(OutboundMessage(
                                 channel=msg.channel, chat_id=msg.chat_id,
-                                content="",
+                                content=self._last_usage_footer,
                                 metadata=meta,
                             ))
                             stream_segment += 1
@@ -539,12 +545,30 @@ class AgentLoop:
                         pending_queue=pending,
                     )
                     if response is not None:
+                        # Non-streaming: footer already appended to content in _process_message
                         await self.bus.publish_outbound(response)
                     elif msg.channel == "cli":
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,
                             content="", metadata=msg.metadata or {},
                         ))
+                        # CLI doesn't stream, but check for any remaining footer
+                        if self._last_usage_footer and self.channels_config and self.channels_config.show_token_usage:
+                            await self.bus.publish_outbound(OutboundMessage(
+                                channel=msg.channel, chat_id=msg.chat_id,
+                                content=self._last_usage_footer, metadata={},
+                            ))
+                    else:
+                        # Streaming channel (e.g. Telegram): on_stream_end was called before
+                        # _last_usage_footer was set. Send the footer separately here.
+                        if self._last_usage_footer and self.channels_config and self.channels_config.show_token_usage:
+                            meta = dict(msg.metadata or {})
+                            meta["_append_footer"] = True
+                            await self.bus.publish_outbound(OutboundMessage(
+                                channel=msg.channel, chat_id=msg.chat_id,
+                                content=self._last_usage_footer,
+                                metadata=meta,
+                            ))
                 except asyncio.CancelledError:
                     logger.info("Task cancelled for session {}", session_key)
                     raise
@@ -597,6 +621,23 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
+    def _append_usage_footer(self, content: str) -> str:
+        """Append token usage footer to content if show_token_usage is enabled."""
+        if not (self.channels_config and self.channels_config.show_token_usage and self._last_usage):
+            logger.debug("_append_usage_footer: skipped - feature off or no usage")
+            self._last_usage_footer = ""
+            return content
+        prompt = self._last_usage.get("prompt_tokens", 0)
+        completion = self._last_usage.get("completion_tokens", 0)
+        logger.debug("_append_usage_footer: prompt={} completion={}", prompt, completion)
+        if prompt or completion:
+            footer = f"\n\ntokens: in={prompt:,} out={completion:,}"
+            self._last_usage_footer = footer
+            content += footer
+        else:
+            self._last_usage_footer = ""
+        return content
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -639,10 +680,13 @@ class AgentLoop:
             self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
             self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+
+            content = self._append_usage_footer(final_content or "Background task completed.")
+
             return OutboundMessage(
                 channel=channel,
                 chat_id=chat_id,
-                content=final_content or "Background task completed.",
+                content=content,
             )
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
@@ -732,6 +776,10 @@ class AgentLoop:
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+
+        # Append token usage footer if configured
+        final_content = self._append_usage_footer(final_content)
+
         meta = dict(msg.metadata or {})
         if on_stream is not None and stop_reason != "error":
             meta["_streamed"] = True
