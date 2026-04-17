@@ -342,6 +342,7 @@ class AgentLoop:
         chat_id: str = "direct",
         message_id: str | None = None,
         pending_queue: asyncio.Queue | None = None,
+        model: str | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -399,7 +400,7 @@ class AgentLoop:
         result = await self.runner.run(AgentRunSpec(
             initial_messages=initial_messages,
             tools=self.tools,
-            model=self.model,
+            model=model or self.model,
             max_iterations=self.max_iterations,
             max_tool_result_chars=self.max_tool_result_chars,
             hook=hook,
@@ -652,6 +653,13 @@ class AgentLoop:
         if self._restore_runtime_checkpoint(session):
             self.sessions.save(session)
 
+        # Sync per-session model override from channel metadata into loop's session manager
+        if temp_model := msg.metadata.get("_temp_model"):
+            if session.metadata.get("temp_model") != temp_model:
+                session.metadata["temp_model"] = temp_model
+                self.sessions.save(session)
+                logger.info("Session {} model updated to {}", key, temp_model)
+
         session, pending = self.auto_compact.prepare_session(session, key)
 
         # Slash commands
@@ -701,6 +709,7 @@ class AgentLoop:
             chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
             pending_queue=pending_queue,
+            model=session.metadata.get("temp_model"),
         )
 
         if final_content is None or not final_content.strip():
@@ -723,7 +732,6 @@ class AgentLoop:
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
-
         meta = dict(msg.metadata or {})
         if on_stream is not None and stop_reason != "error":
             meta["_streamed"] = True

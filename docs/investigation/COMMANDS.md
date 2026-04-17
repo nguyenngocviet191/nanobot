@@ -178,8 +178,8 @@ async def dispatch(self, ctx: CommandContext) -> OutboundMessage | None:
 | `/stop` | Priority | Dừng task đang chạy |
 | `/restart` | Priority | Restart agent |
 | `/clear` | Exact | Xóa session history |
-| `/status` | Exact | Hiển thị trạng thái |
-| `/models` | Channel-specific | Chọn AI provider/model qua inline buttons |
+| `/status` | Exact | Hiển thị trạng thái (model, tokens, uptime). Hiện model override của session nếu đã dùng `/models` |
+| `/models` | Channel-specific | Chọn AI provider/model qua inline buttons. Model áp dụng ngay cho session hiện tại |
 | `/dream` | Exact | Trigger Dream memory consolidation |
 | `/dream-log` | Prefix | Xem thay đổi của Dream |
 | `/dream-restore` | Prefix | Khôi phục memory về phiên bản trước |

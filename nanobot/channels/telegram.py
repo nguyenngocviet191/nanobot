@@ -238,6 +238,7 @@ class TelegramChannel(BaseChannel):
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
         self._custom_commands = CustomCommandsLoader(get_workspace_path())
+        self._session_models: dict[str, str] = {}  # session_key -> temp model override
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -870,6 +871,13 @@ class TelegramChannel(BaseChannel):
         if len(self._message_threads) > 1000:
             self._message_threads.pop(next(iter(self._message_threads)))
 
+    def _enrich_metadata_with_model(self, metadata: dict, chat_id: str, session_key: str | None) -> dict:
+        """Inject temp model override into metadata so AgentLoop can sync it to its session manager."""
+        effective_key = session_key or f"telegram:{chat_id}"
+        if temp_model := self._session_models.get(effective_key):
+            return {**metadata, "_temp_model": temp_model}
+        return metadata
+
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
         if not update.message or not update.effective_user:
@@ -877,7 +885,7 @@ class TelegramChannel(BaseChannel):
         message = update.message
         user = update.effective_user
         self._remember_thread_context(message)
-        
+
         # Strip @bot_username suffix if present
         content = message.text or ""
         if content.startswith("/") and "@" in content:
@@ -885,13 +893,17 @@ class TelegramChannel(BaseChannel):
             cmd_part = cmd_part.split("@")[0]
             content = f"{cmd_part} {rest[0]}" if rest else cmd_part
         content = self._normalize_telegram_command(content)
-            
+
+        chat_id = str(message.chat_id)
+        session_key = self._derive_topic_session_key(message)
+        metadata = self._enrich_metadata_with_model(self._build_message_metadata(message, user), chat_id, session_key)
+
         await self._handle_message(
             sender_id=self._sender_id(user),
-            chat_id=str(message.chat_id),
+            chat_id=chat_id,
             content=content,
-            metadata=self._build_message_metadata(message, user),
-            session_key=self._derive_topic_session_key(message),
+            metadata=metadata,
+            session_key=session_key,
         )
 
     async def _on_custom_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -927,12 +939,16 @@ class TelegramChannel(BaseChannel):
 
 User args: {args}"""
 
+        chat_id = str(message.chat_id)
+        session_key = self._derive_topic_session_key(message)
+        metadata = self._enrich_metadata_with_model(self._build_message_metadata(message, user), chat_id, session_key)
+
         await self._handle_message(
             sender_id=self._sender_id(user),
-            chat_id=str(message.chat_id),
+            chat_id=chat_id,
             content=instruction,
-            metadata=self._build_message_metadata(message, user),
-            session_key=self._derive_topic_session_key(message),
+            metadata=metadata,
+            session_key=session_key,
         )
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -993,8 +1009,8 @@ User args: {args}"""
         logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
 
         str_chat_id = str(chat_id)
-        metadata = self._build_message_metadata(message, user)
         session_key = self._derive_topic_session_key(message)
+        metadata = self._enrich_metadata_with_model(self._build_message_metadata(message, user), str_chat_id, session_key)
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
         if media_group_id := getattr(message, "media_group_id", None):
@@ -1361,18 +1377,9 @@ User args: {args}"""
         return []
 
     async def _apply_model_to_session(self, chat_id: str, model_full: str) -> None:
-        """Store selected model in session metadata."""
-        from nanobot.session.manager import SessionManager
-        from nanobot.config.paths import get_workspace_path
-
+        """Store selected model in memory so it propagates via next message metadata."""
         session_key = f"telegram:{chat_id}"
-        workspace = get_workspace_path()
-        session_mgr = SessionManager(workspace)
-        session = session_mgr.get_or_create(session_key)
-
-        session.metadata["temp_model"] = model_full
-        session_mgr.save(session)
-
+        self._session_models[session_key] = model_full
         logger.info("Session {} temp model set to {}", session_key, model_full)
 
     def _get_extension(

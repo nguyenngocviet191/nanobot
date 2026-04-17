@@ -1,6 +1,6 @@
 # Feature: `/models` Command - Inline Model Selection
 
-## Status: ✅ Implemented
+## Status: ✅ Implemented & Fixed (2026-04-18)
 
 ## Context
 
@@ -10,12 +10,12 @@ User wants a `/models` slash command that shows inline buttons to select AI prov
 
 **Approach:** Built-in command (not markdown command)
 **Flow:** Two-tier navigation (Provider → Model)
-**Storage:** Session metadata (`session.metadata["temp_model"]`)
+**Storage:** In-memory dict trên channel → propagate qua message metadata → `loop.sessions`
 **Display:** Edit message to show model indicator after selection
 
 ---
 
-## Architecture
+## Architecture (Actual Implementation)
 
 ```
 User: /models
@@ -39,9 +39,51 @@ CallbackQuery handler → Edit message with model buttons
 User taps model
     │
     ▼
-1. Store in session.metadata["temp_model"]
+1. self._session_models[session_key] = model_full   ← in-memory, không tạo SessionManager mới
 2. Edit message → "🤖 Using: {provider}/{model}"
+    │
+    ▼
+User gửi bất kỳ message/command (kể cả /status)
+    │
+    ▼
+_enrich_metadata_with_model()  ← inject _temp_model vào InboundMessage.metadata
+    │
+    ▼
+loop._process_message()
+    │
+    ▼
+session.metadata["temp_model"] = model   ← update loop.sessions (đúng instance)
+loop.sessions.save(session)              ← persist xuống disk
 ```
+
+---
+
+## Tại sao không dùng SessionManager riêng
+
+**Vấn đề gốc:** `_apply_model_to_session` ban đầu tạo `SessionManager(workspace)` mới. Instance này save xuống disk nhưng `loop.sessions` có in-memory cache riêng → cache stale → `/status` vẫn hiện model cũ.
+
+**Giải pháp:** Channel lưu model vào `self._session_models` (dict thuần), inject qua message metadata, để loop tự update `loop.sessions` của nó.
+
+---
+
+## Luồng `/status` sau khi đổi model
+
+```
+/status
+  → _forward_command()
+  → _enrich_metadata_with_model()        ← đọc từ self._session_models
+  → metadata["_temp_model"] = "zhipu/glm-5-turbo"
+  → loop._process_message()
+  → session.metadata["temp_model"] = ... ← sync vào loop.sessions
+  → cmd_status()
+  → ctx.msg.metadata.get("_temp_model")  ← đọc trực tiếp từ message metadata
+  → hiện đúng model ngay lập tức ✓
+```
+
+`cmd_status` đọc model theo thứ tự ưu tiên:
+1. `ctx.msg.metadata["_temp_model"]` — từ message hiện tại (fresh nhất)
+2. `session.metadata["temp_model"]` — persist từ lần trước
+3. `loop.model` — model mặc định của agent
 
 ---
 
@@ -50,14 +92,14 @@ User taps model
 ### Priority Order
 
 ```
-1. Config "models" field in ProviderConfig
-       ↓ (if empty or not set)
-2. Fetch from provider's /v1/models API
-       ↓ (if fails or empty)
-3. Hardcoded defaults from PROVIDERS registry
+1. Config "models" field trong ProviderConfig
+       ↓ (nếu rỗng)
+2. Fetch từ provider's /v1/models API
+       ↓ (nếu lỗi hoặc rỗng)
+3. Hardcoded defaults từ PROVIDERS registry
 ```
 
-### Config Schema Change
+### Config Schema
 
 **File:** `nanobot/config/schema.py`
 
@@ -66,10 +108,8 @@ class ProviderConfig(Base):
     api_key: str = ""
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None
-    models: list[str] = []  # NEW: explicit model list override
+    models: list[str] = []  # explicit model list override
 ```
-
-**File:** `nanobot/config/schema.py` (ProvidersConfig already allows extra fields via `extra="allow"`)
 
 ### Config Example
 
@@ -80,9 +120,6 @@ class ProviderConfig(Base):
       "apiKey": "...",
       "apiBase": "https://my-endpoint.com/v1",
       "models": ["custom-model-1", "custom-model-2"]
-    },
-    "openrouter": {
-      "apiKey": "sk-or-..."
     }
   }
 }
@@ -90,259 +127,60 @@ class ProviderConfig(Base):
 
 ---
 
-## Model Resolution Implementation
-
-```python
-async def _get_models_for_provider(provider_name: str, config: Config) -> list[str]:
-    """
-    Get available models for a provider.
-    Priority: config.models > fetch from API > hardcoded defaults
-    """
-    from nanobot.providers.registry import PROVIDERS, find_by_name
-
-    # 1. Check explicit config
-    provider_config = getattr(config.providers, provider_name, None)
-    if provider_config and provider_config.models:
-        return provider_config.models
-
-    # 2. Try fetch from /v1/models
-    if provider_config and provider_config.api_key:
-        fetched = await _fetch_models_from_api(provider_name, provider_config)
-        if fetched:
-            return fetched
-
-    # 3. Fallback to hardcoded defaults
-    return _get_hardcoded_models(provider_name)
-```
-
----
-
-## Hardcoded Default Models
-
-```python
-DEFAULT_PROVIDER_MODELS = {
-    "anthropic": [
-        "claude-3-5-sonnet-20241022",
-        "claude-3-opus-20240229",
-        "claude-3-haiku-20240307",
-    ],
-    "openai": [
-        "gpt-4o",
-        "gpt-4o-mini",
-        "gpt-4-turbo",
-    ],
-    "deepseek": [
-        "deepseek-chat",
-        "deepseek-coder",
-    ],
-    "openrouter": [],  # Must fetch - dynamic gateway
-    "gemini": [
-        "gemini-1.5-pro",
-        "gemini-1.5-flash",
-        "gemini-1.5-pro-exp-0806",
-    ],
-    "moonshot": [
-        "moonshot-v1-8k",
-        "moonshot-v1-32k",
-        "kimi-k2.5",
-    ],
-    # ... add more as needed
-}
-```
-
----
-
 ## Telegram Implementation
 
-### 1. Register Command
+### Files Modified
 
-**File:** `nanobot/channels/telegram.py`
+| File | Changes |
+|------|---------|
+| `nanobot/channels/telegram.py` | `_session_models` dict, `_enrich_metadata_with_model()`, `/models` handlers |
+| `nanobot/agent/loop.py` | Sync `_temp_model` từ metadata, `_run_agent_loop` nhận optional `model` param |
+| `nanobot/command/builtin.py` | `cmd_status` đọc `_temp_model` từ message metadata |
 
-```python
-class TelegramChannel(BaseChannel):
-    BOT_COMMANDS = [
-        # ... existing commands ...
-        BotCommand("models", "Switch AI model for this session"),
-    ]
-
-    async def start(self) -> None:
-        # ... existing code ...
-
-        # Add /models handler
-        self._app.add_handler(
-            MessageHandler(
-                filters.Regex(r"^/models(?:@\w+)?(?:\s+.*)?$"),
-                self._on_models_command,
-            )
-        )
-
-        # Add callback query handler for inline buttons
-        self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
-```
-
-### 1b. Important: Enable callback_query in polling
-
-**File:** `nanobot/channels/telegram.py`
+### Key Methods
 
 ```python
-await self._app.updater.start_polling(
-    allowed_updates=["message", "callback_query"],  # Must include "callback_query"
-    drop_pending_updates=False,
-    error_callback=self._on_polling_error,
-)
-```
+# telegram.py
+def _enrich_metadata_with_model(self, metadata: dict, chat_id: str, session_key: str | None) -> dict:
+    """Inject temp model override vào metadata cho AgentLoop."""
+    effective_key = session_key or f"telegram:{chat_id}"
+    if temp_model := self._session_models.get(effective_key):
+        return {**metadata, "_temp_model": temp_model}
+    return metadata
 
-⚠️ **Note:** Without `"callback_query"` in `allowed_updates`, inline button clicks will NOT trigger the callback handler.
-
-### 2. Provider Listing
-
-```python
-async def _on_models_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /models command - show provider selection."""
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-    config = self._load_config()
-    providers = self._get_configured_providers(config)
-
-    if not providers:
-        await update.message.reply_text("⚠️ No providers configured.")
-        return
-
-    # Build provider buttons (2 per row)
-    buttons = []
-    for provider in providers:
-        buttons.append([
-            InlineKeyboardButton(
-                provider["label"],
-                callback_data=f"mdl:prov:{provider['name']}"
-            )
-        ])
-
-    keyboard = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text(
-        "🤖 *Select AI Provider*\n\nUse buttons below to choose provider:",
-        parse_mode="Markdown",
-        reply_markup=keyboard,
-    )
-```
-
-### 3. Model Listing (Callback Handler)
-
-```python
-async def _on_callback_query(self, update: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline button callbacks."""
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-    chat_id = query.message.chat_id
-    message_id = query.message.message_id
-
-    if data.startswith("mdl:prov:"):
-        # Provider selected → show models
-        provider_name = data.split(":")[2]
-        models = await self._get_models_for_provider(provider_name)
-
-        if not models:
-            await query.edit_message_text("⚠️ No models available for this provider.")
-            return
-
-        # Build model buttons
-        buttons = [
-            [InlineKeyboardButton(model, callback_data=f"mdl:model:{provider_name}:{model}")]
-            for model in models
-        ]
-        buttons.append([
-            InlineKeyboardButton("← Back", callback_data="mdl:back:providers")
-        ])
-
-        keyboard = InlineKeyboardMarkup(buttons)
-        await query.edit_message_text(
-            f"🤖 *Select Model for {provider_name}*\n\nTap to select:",
-            parse_mode="Markdown",
-            reply_markup=keyboard,
-        )
-
-    elif data.startswith("mdl:model:"):
-        # Model selected → apply and show indicator
-        _, _, provider_name, model_name = data.split(":", 3)
-        model_full = f"{provider_name}/{model_name}"
-
-        # Store in session
-        await self._apply_model_to_session(chat_id, model_full)
-
-        # Update message to indicator
-        await query.edit_message_text(
-            f"🤖 Using: {model_full}",
-            parse_mode="Markdown",
-        )
-
-    elif data == "mdl:back:providers":
-        # Back to provider list → re-show providers
-        await self._on_models_command_with_edit(query, context)
-```
-
-### 4. Session Model Application
-
-```python
 async def _apply_model_to_session(self, chat_id: str, model_full: str) -> None:
-    """Store selected model in session metadata."""
-    # Get session key for this chat
+    """Store selected model in memory — propagate qua message metadata."""
     session_key = f"telegram:{chat_id}"
-
-    # Get or create session
-    session = self.sessions.get_or_create(session_key)
-
-    # Store temp model
-    session.metadata["temp_model"] = model_full
-    self.sessions.save(session)
-
+    self._session_models[session_key] = model_full
     logger.info("Session {} temp model set to {}", session_key, model_full)
 ```
 
-### 5. Config Loader Helper
-
 ```python
-def _get_configured_providers(self, config: Config) -> list[dict]:
-    """Get providers that have API key configured."""
-    providers = []
-    for spec in PROVIDERS:
-        provider_config = getattr(config.providers, spec.name, None)
-        if provider_config and provider_config.api_key:
-            providers.append({
-                "name": spec.name,
-                "label": spec.label,
-                "api_key": provider_config.api_key,
-                "api_base": provider_config.api_base or spec.default_api_base or "",
-            })
-    return providers
+# loop.py — trong _process_message()
+if temp_model := msg.metadata.get("_temp_model"):
+    if session.metadata.get("temp_model") != temp_model:
+        session.metadata["temp_model"] = temp_model
+        self.sessions.save(session)
 ```
 
-### 6. Model Fetch from API
+```python
+# builtin.py — trong cmd_status()
+model = ctx.msg.metadata.get("_temp_model") or session.metadata.get("temp_model") or loop.model
+```
+
+### Handler Registration
 
 ```python
-async def _fetch_models_from_api(self, provider_name: str, provider_config) -> list[str]:
-    """Try to fetch model list from provider's /v1/models endpoint."""
-    if not provider_config.api_base:
-        return []
-
-    try:
-        import httpx
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{provider_config.api_base}/models",
-                headers={"Authorization": f"Bearer {provider_config.api_key}"},
-                timeout=5.0,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                return [m["id"] for m in data.get("data", [])]
-    except Exception as e:
-        logger.debug("Failed to fetch models from {}: {}", provider_name, e)
-    return []
+# /models command
+self._app.add_handler(MessageHandler(
+    filters.Regex(r"^/models(?:@\w+)?(?:\s+.*)?$"),
+    self._on_models_command,
+))
+# Callback query cho inline buttons
+self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
 ```
+
+⚠️ **Bắt buộc** include `"callback_query"` trong `allowed_updates` khi polling, nếu không inline button clicks sẽ không hoạt động.
 
 ---
 
@@ -350,45 +188,29 @@ async def _fetch_models_from_api(self, provider_name: str, provider_config) -> l
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ User types: /models                                        │
+│ User: /models                                               │
 └─────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ Bot replies:                                               │
-│ 🤖 Select AI Provider                                      │
-│                                                             │
-│ [Anthropic] [OpenAI] [DeepSeek]                            │
-│ [Google] [Meta] ...                                        │
+│ 🤖 Select AI Provider                                       │
+│ [Anthropic] [OpenAI] [DeepSeek] ...                         │
 └─────────────────────────────────────────────────────────────┘
-                              ↓
-                    User taps "Anthropic"
-                              ↓
+                              ↓ tap provider
 ┌─────────────────────────────────────────────────────────────┐
-│ Bot edits message:                                         │
-│ 🤖 Select Model for Anthropic                              │
-│                                                             │
-│ [claude-3-5-sonnet-20241022]                               │
-│ [claude-3-opus-20240229]                                   │
-│ [claude-3-haiku-20240307]                                  │
-│ [← Back]                                                   │
+│ 🤖 Select Model for Anthropic                               │
+│ [claude-3-5-sonnet-20241022]                                │
+│ [claude-3-opus-20240229]                                    │
+│ [← Back]                                                    │
 └─────────────────────────────────────────────────────────────┘
-                              ↓
-                    User taps "claude-3-5-sonnet-20241022"
-                              ↓
+                              ↓ tap model
 ┌─────────────────────────────────────────────────────────────┐
-│ Bot edits message:                                         │
-│ 🤖 Using: anthropic/claude-3-5-sonnet-20241022             │
+│ 🤖 Using: anthropic/claude-3-5-sonnet-20241022              │
 └─────────────────────────────────────────────────────────────┘
+                              ↓
+                  self._session_models[key] = model
+                              ↓ next message/command
+                  _enrich_metadata_with_model() → loop syncs
 ```
-
----
-
-## Files to Modify
-
-| File | Changes |
-|------|---------|
-| `nanobot/config/schema.py` | Add `models: list[str]` to `ProviderConfig` |
-| `nanobot/channels/telegram.py` | Add `/models` command, callback handler, model resolution |
 
 ---
 
@@ -398,14 +220,11 @@ async def _fetch_models_from_api(self, provider_name: str, provider_config) -> l
 |----------|----------|
 | No providers configured | "⚠️ No providers configured." |
 | Provider has no models | "⚠️ No models available for this provider." |
-| API fetch fails | Fallback to config.models or hardcoded defaults |
-| Session not found | Create new session, apply model |
+| API fetch fails | Fallback to config.models hoặc hardcoded defaults |
 
 ---
 
-## Edge Cases
+## Known Limitations
 
-1. **User clicks rapidly** - CallbackQuery handler should handle gracefully, no double-selection
-2. **Session expires** - temp_model persists in session file, survives restarts
-3. **Provider removed from config** - Button won't appear since provider list comes from configured providers
-4. **Message edit fails** (e.g., too old) - Catch exception, send new message instead
+- `self._session_models` là in-memory → mất khi bot restart. Sau restart, model vẫn được load từ disk (vì `loop.sessions` persist `session.metadata["temp_model"]` xuống disk khi xử lý message đầu tiên).
+- Model override là per-session (per chat_id). Topic threads dùng key riêng.
