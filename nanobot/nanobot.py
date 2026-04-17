@@ -83,6 +83,7 @@ class Nanobot:
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
             session_ttl_minutes=defaults.session_ttl_minutes,
+            show_token_usage=defaults.show_token_usage,
         )
         return cls(loop)
 

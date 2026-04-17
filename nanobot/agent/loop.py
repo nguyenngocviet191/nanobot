@@ -152,12 +152,14 @@ class AgentLoop:
         session_ttl_minutes: int = 0,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
+        show_token_usage: bool = False,
     ):
         from nanobot.config.schema import ExecToolConfig, WebToolsConfig
 
         defaults = AgentDefaults()
         self.bus = bus
         self.channels_config = channels_config
+        self.show_token_usage = show_token_usage
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
@@ -535,7 +537,7 @@ class AgentLoop:
                             meta["_stream_id"] = _current_stream_id()
                             await self.bus.publish_outbound(OutboundMessage(
                                 channel=msg.channel, chat_id=msg.chat_id,
-                                content=self._last_usage_footer,
+                                content="",
                                 metadata=meta,
                             ))
                             stream_segment += 1
@@ -545,29 +547,26 @@ class AgentLoop:
                         pending_queue=pending,
                     )
                     if response is not None:
-                        # Non-streaming: footer already appended to content in _process_message
                         await self.bus.publish_outbound(response)
-                    elif msg.channel == "cli":
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata=msg.metadata or {},
-                        ))
-                        # CLI doesn't stream, but check for any remaining footer
-                        if self._last_usage_footer and self.channels_config and self.channels_config.show_token_usage:
+
+                    # Send token usage footer as a separate follow-up message.
+                    # For streaming channels (Telegram, CLI), the response has _streamed=True
+                    # so manager ignores it — footer must be sent separately.
+                    # For tool responses (response=None), footer was never computed.
+                    # Skip only for true non-streaming SDK responses (footer already embedded).
+                    is_non_streaming_sdk = (
+                        response is not None
+                        and not response.metadata.get("_streamed")
+                    )
+                    if self.show_token_usage and self._last_usage and not is_non_streaming_sdk:
+                        prompt = self._last_usage.get("prompt_tokens", 0)
+                        completion = self._last_usage.get("completion_tokens", 0)
+                        if prompt or completion:
+                            footer = f"\n\ntokens: in={prompt:,} out={completion:,}"
                             await self.bus.publish_outbound(OutboundMessage(
                                 channel=msg.channel, chat_id=msg.chat_id,
-                                content=self._last_usage_footer, metadata={},
-                            ))
-                    else:
-                        # Streaming channel (e.g. Telegram): on_stream_end was called before
-                        # _last_usage_footer was set. Send the footer separately here.
-                        if self._last_usage_footer and self.channels_config and self.channels_config.show_token_usage:
-                            meta = dict(msg.metadata or {})
-                            meta["_append_footer"] = True
-                            await self.bus.publish_outbound(OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content=self._last_usage_footer,
-                                metadata=meta,
+                                content=footer,
+                                metadata={},
                             ))
                 except asyncio.CancelledError:
                     logger.info("Task cancelled for session {}", session_key)
@@ -623,7 +622,7 @@ class AgentLoop:
 
     def _append_usage_footer(self, content: str) -> str:
         """Append token usage footer to content if show_token_usage is enabled."""
-        if not (self.channels_config and self.channels_config.show_token_usage and self._last_usage):
+        if not (self.show_token_usage and self._last_usage):
             logger.debug("_append_usage_footer: skipped - feature off or no usage")
             self._last_usage_footer = ""
             return content
