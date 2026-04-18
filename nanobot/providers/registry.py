@@ -83,6 +83,19 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_direct=True,
     ),
 
+    # 9router: OpenAI-compatible gateway at 103.245.237.43:20128
+    ProviderSpec(
+        name="nine_router",
+        keywords=("9router",),
+        env_key="",
+        display_name="9router",
+        backend="openai_compat",
+        is_gateway=True,
+        is_direct=True,
+        detect_by_base_keyword="103.245.237.43",
+        default_api_base="http://103.245.237.43:20128/v1",
+    ),
+
     # === Azure OpenAI (direct API calls with API version 2024-10-21) =====
     ProviderSpec(
         name="azure_openai",
@@ -372,4 +385,10 @@ def find_by_name(name: str) -> ProviderSpec | None:
     for spec in PROVIDERS:
         if spec.name == normalized:
             return spec
+    # Handle numeric-first aliases (e.g. "9router" -> "nine_router")
+    if name.startswith("9") and name.endswith("router"):
+        alias_normalized = "nine_" + name[1:]
+        for spec in PROVIDERS:
+            if spec.name == alias_normalized:
+                return spec
     return None
