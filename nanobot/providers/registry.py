@@ -358,6 +358,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="openai_compat",
         default_api_base="https://qianfan.baidubce.com/v2"
     ),
+
 )
 
 
