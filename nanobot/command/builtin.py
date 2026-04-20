@@ -9,6 +9,7 @@ import sys
 from nanobot import __version__
 from nanobot.bus.events import OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter
+from nanobot.command.agents import cmd_agents
 from nanobot.utils.helpers import build_status_content
 from nanobot.utils.restart import set_restart_notice_to_env
 
@@ -74,11 +75,13 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
             search_usage_text = usage.format()
     except Exception:
         pass  # Never let usage fetch break /status
+    # Use session temp_model if set (from /models selection), otherwise loop.model
+    display_model = session.metadata.get("temp_model") or loop.model
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
         content=build_status_content(
-            version=__version__, model=ctx.msg.metadata.get("_temp_model") or session.metadata.get("temp_model") or loop.model,
+            version=__version__, model=display_model,
             start_time=loop._start_time, last_usage=loop._last_usage,
             context_window_tokens=loop.context_window_tokens,
             session_msg_count=len(session.get_history(max_messages=0)),
@@ -341,5 +344,6 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/dream-log", cmd_dream_log)
     router.prefix("/dream-log ", cmd_dream_log)
     router.exact("/dream-restore", cmd_dream_restore)
+    router.exact("/agents", cmd_agents)
     router.prefix("/dream-restore ", cmd_dream_restore)
     router.exact("/help", cmd_help)

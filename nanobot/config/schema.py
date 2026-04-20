@@ -266,6 +266,27 @@ class Config(BaseSettings):
                 if spec.is_oauth or spec.is_local or p.api_key:
                     return p, spec.name
 
+        # Resolve "custom" prefix → nine_router when custom provider uses 9router gateway
+        # (custom provider uses 9router gateway, so its models need strip_model_prefix handling)
+        if model_prefix == "custom":
+            for spec in PROVIDERS:
+                if not spec.is_gateway:
+                    continue
+                p = getattr(self.providers, spec.name, None)
+                if p and p.api_base and spec.detect_by_base_keyword and spec.detect_by_base_keyword in p.api_base:
+                    return p, spec.name
+
+        # Fallback: gateway detection by api_base keyword
+        # (e.g. 9router at 103.245.237.43 should match other prefixed models when no explicit provider matched)
+        for spec in PROVIDERS:
+            if not spec.is_gateway:
+                continue
+            p = getattr(self.providers, spec.name, None)
+            if not (p and p.api_base):
+                continue
+            if spec.detect_by_base_keyword and spec.detect_by_base_keyword in p.api_base:
+                return p, spec.name
+
         # Fallback: configured local providers can route models without
         # provider-specific keywords (for example plain "llama3.2" on Ollama).
         # Prefer providers whose detect_by_base_keyword matches the configured api_base
@@ -292,6 +313,18 @@ class Config(BaseSettings):
             p = getattr(self.providers, spec.name, None)
             if p and p.api_key:
                 return p, spec.name
+
+        # Gateway fallback: match providers by their detect_by_base_keyword
+        # (e.g. 9router at 103.245.237.43 matches models with "custom/" prefix)
+        for spec in PROVIDERS:
+            if not spec.is_gateway:
+                continue
+            p = getattr(self.providers, spec.name, None)
+            if not (p and p.api_base):
+                continue
+            if spec.detect_by_base_keyword and spec.detect_by_base_keyword in p.api_base:
+                return p, spec.name
+
         return None, None
 
     def get_provider(self, model: str | None = None) -> ProviderConfig | None:

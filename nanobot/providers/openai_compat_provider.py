@@ -289,7 +289,10 @@ class OpenAICompatProvider(LLMProvider):
                 messages, tools = self._apply_cache_control(messages, tools)
 
         if spec and spec.strip_model_prefix:
-            model_name = model_name.split("/")[-1]
+            # Strip only "custom/" wrapper prefix, preserve actual model prefix (glm/, minimax/, etc.)
+            parts = model_name.split("/")
+            if parts[0] == "custom":
+                model_name = "/".join(parts[1:])
 
         kwargs: dict[str, Any] = {
             "model": model_name,

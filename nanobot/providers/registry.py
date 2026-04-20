@@ -84,9 +84,11 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     ),
 
     # 9router: OpenAI-compatible gateway at 103.245.237.43:20128
+    # NOTE: strip "custom/" prefix - 9router only accepts bare model names (glm/glm-5, combo-claw, etc.)
+    # Model names stored in session keep full prefix for user clarity
     ProviderSpec(
         name="nine_router",
-        keywords=("9router",),
+        keywords=("9router", "nine_router", "custom"),  # "custom" matches /models custom/<model>
         env_key="",
         display_name="9router",
         backend="openai_compat",
@@ -94,6 +96,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_direct=True,
         detect_by_base_keyword="103.245.237.43",
         default_api_base="http://103.245.237.43:20128/v1",
+        strip_model_prefix=True,
     ),
 
     # === Azure OpenAI (direct API calls with API version 2024-10-21) =====

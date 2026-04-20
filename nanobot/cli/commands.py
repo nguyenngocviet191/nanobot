@@ -227,6 +227,212 @@ def _is_exit_command(command: str) -> bool:
     return command.lower() in EXIT_COMMANDS
 
 
+def _is_models_command(command: str) -> bool:
+    """Check if command is /models or /models <provider>/<model>."""
+    return command.strip().startswith("/models")
+
+
+def _get_configured_providers(config: Config) -> list[dict]:
+    """Get providers that have API key configured."""
+    from nanobot.providers.registry import PROVIDERS
+
+    providers = []
+    for spec in PROVIDERS:
+        provider_config = getattr(config.providers, spec.name, None)
+        if provider_config and provider_config.api_key:
+            providers.append({
+                "name": spec.name,
+                "label": spec.label,
+                "api_key": provider_config.api_key,
+                "api_base": provider_config.api_base or spec.default_api_base or "",
+                "config": provider_config,
+            })
+    return providers
+
+
+async def _get_models_for_provider(config: Config, provider_name: str) -> list[str]:
+    """Get available models for a provider with priority: config > API > defaults."""
+    from nanobot.providers.registry import find_by_name
+
+    # Try to get provider config if config is available
+    provider_config = None
+    if config:
+        provider_config = getattr(config.providers, provider_name, None)
+
+    # If no provider_config found, fallback to defaults
+    if not provider_config:
+        return _get_default_provider_models(provider_name)
+
+    # 1. Check explicit config models list
+    if provider_config.models:
+        return provider_config.models
+
+    # 2. Try fetch from /v1/models API
+    # Resolve effective api_base using registry default as fallback
+    spec = find_by_name(provider_name)
+    effective_api_base = provider_config.api_base or (spec.default_api_base if spec else None)
+    if provider_config.api_key and effective_api_base:
+        fetched = await _fetch_models_from_api(provider_config, effective_api_base)
+        if fetched:
+            return fetched
+
+    # 3. Fallback to hardcoded defaults
+    return _get_default_provider_models(provider_name)
+
+
+def _get_default_provider_models(provider_name: str) -> list[str]:
+    """Get default models for a provider."""
+    DEFAULT_PROVIDER_MODELS = {
+        "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
+        "anthropic": ["claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-haiku-20240307"],
+        "openrouter": ["anthropic/claude-sonnet-4", "openai/gpt-4o", "google/gemini-pro-1.5"],
+        "groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
+        "ollama": ["llama3", "mistral", "codellama"],
+        "deepseek": ["deepseek-chat", "deepseek-coder"],
+        "openai_compat": ["gpt-4o", "gpt-4o-mini"],
+    }
+    return DEFAULT_PROVIDER_MODELS.get(provider_name, [])
+
+
+async def _fetch_models_from_api(provider_config, effective_api_base: str) -> list[str]:
+    """Try to fetch model list from provider's /v1/models endpoint."""
+    if not effective_api_base:
+        return []
+
+    try:
+        import httpx
+
+        # Normalize api_base: ensure it ends with /v1 or /v1/
+        normalized_base = effective_api_base.rstrip("/")
+        if not normalized_base.endswith("/v1"):
+            normalized_base = f"{normalized_base}/v1"
+
+        async with httpx.AsyncClient() as client:
+            headers = {"Authorization": f"Bearer {provider_config.api_key}"}
+            if provider_config.extra_headers:
+                headers.update(provider_config.extra_headers)
+
+            response = await client.get(
+                f"{normalized_base}/models",
+                headers=headers,
+                timeout=5.0,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                # Handle OpenAI-compatible response format: {"data": [{"id": "model-id", ...}]}
+                if "data" in data:
+                    return [m["id"] for m in data.get("data", [])]
+                # Handle alternative format: {"models": [{"id": "model-id", ...}]}
+                if "models" in data:
+                    return [m["id"] for m in data.get("models", [])]
+    except Exception as e:
+        logger.debug("Failed to fetch models from {}: {}", effective_api_base, e)
+    return []
+
+
+async def _handle_models_command(command: str, config: Config, session_key: str) -> bool:
+    """Handle /models command. Returns True if command was handled."""
+    command = command.strip()
+    if not command.startswith("/models"):
+        return False
+
+    parts = command.split(None, 1)  # Split on whitespace
+    if len(parts) == 1:
+        # Just "/models" - show providers
+        providers = _get_configured_providers(config)
+        if not providers:
+            console.print("[yellow]⚠️  No providers configured.[/yellow]")
+            console.print("Add API keys to your config file to enable providers.")
+            return True
+
+        table = Table(title="🤖 Available AI Providers")
+        table.add_column("Provider", style="cyan")
+        table.add_column("Models", style="dim")
+        table.add_column("Usage", style="green")
+
+        for p in providers:
+            provider_name = p["name"]
+            # Get model count (synchronously for display)
+            provider_config = getattr(config.providers, provider_name, None)
+            model_count = len(provider_config.models) if provider_config and provider_config.models else "default"
+            table.add_row(
+                p["label"],
+                str(model_count),
+                f"/models {provider_name}"
+            )
+
+        console.print(table)
+        console.print("\n[dim]Usage: /models <provider> to list models[/dim]")
+        console.print("[dim]      /models <provider>/<model> to select a model[/dim]")
+        return True
+
+    # "/models <arg>" - parse argument
+    arg = parts[1].strip()
+
+    if "/" in arg:
+        # "/models provider/model" - select specific model
+        provider_name, model_name = arg.split("/", 1)
+        provider_name = provider_name.strip()
+        model_name = model_name.strip()
+
+        # Validate provider
+        providers = _get_configured_providers(config)
+        provider_names = [p["name"] for p in providers]
+        if provider_name not in provider_names:
+            console.print(f"[yellow]⚠️  Provider '{provider_name}' not configured or not found.[/yellow]")
+            return True
+
+        # Validate model
+        models = await _get_models_for_provider(config, provider_name)
+        if model_name not in models:
+            console.print(f"[yellow]⚠️  Model '{model_name}' not found for provider '{provider_name}'.[/yellow]")
+            console.print(f"[dim]Available models for {provider_name}: {', '.join(models)}[/dim]")
+            return True
+
+        # Store in session metadata
+        # Store ONLY model name (no provider prefix), e.g. "glm/glm-5" not "custom/glm/glm-5"
+        # The provider name is already part of the model name from the registry
+        model_full = model_name  # Just use the model name as-is from registry
+
+        from nanobot.session.manager import SessionManager
+        session_mgr = SessionManager(config.workspace_path)
+        session = session_mgr.get_or_create(session_key)
+        session.metadata["temp_model"] = model_full
+        session_mgr.save(session)
+
+        console.print(f"[green]✓[/green] Model set to: [cyan]{model_full}[/cyan]")
+        console.print("[dim]This model will be used for the next message.[/dim]")
+        return True
+
+    else:
+        # "/models provider" - list models for provider
+        provider_name = arg.strip()
+
+        # Validate provider
+        providers = _get_configured_providers(config)
+        provider_names = [p["name"] for p in providers]
+        if provider_name not in provider_names:
+            console.print(f"[yellow]⚠️  Provider '{provider_name}' not configured or not found.[/yellow]")
+            console.print(f"[dim]Available providers: {', '.join(provider_names)}[/dim]")
+            return True
+
+        models = await _get_models_for_provider(config, provider_name)
+        if not models:
+            console.print(f"[yellow]⚠️  No models available for provider '{provider_name}'.[/yellow]")
+            return True
+
+        table = Table(title=f"🤖 Models for {provider_name}")
+        table.add_column("Model", style="cyan")
+        table.add_column("Usage", style="green")
+
+        for model in models:
+            table.add_row(model, f"/models {provider_name}/{model}")
+
+        console.print(table)
+        console.print(f"\n[dim]Usage: /models {provider_name}/<model> to select[/dim]")
+        return True
+
+
 async def _read_interactive_input_async() -> str:
     """Read user input using prompt_toolkit (handles paste, history, display).
 
@@ -943,12 +1149,21 @@ def agent(
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
+            # Check if session has temp_model override
+            from nanobot.session.manager import SessionManager
+            session_mgr = SessionManager(config.workspace_path)
+            session = session_mgr.get_or_create(session_id)
+            metadata = {}
+            if session and session.metadata.get("temp_model"):
+                metadata["_temp_model"] = session.metadata["temp_model"]
+
             renderer = StreamRenderer(render_markdown=markdown)
             response = await agent_loop.process_direct(
                 message, session_id,
                 on_progress=_cli_progress,
                 on_stream=renderer.on_delta,
                 on_stream_end=renderer.on_end,
+                metadata=metadata,
             )
             if not renderer.streamed:
                 await renderer.close()
@@ -1059,16 +1274,28 @@ def agent(
                             console.print("\nGoodbye!")
                             break
 
+                        # Handle /models command before sending to agent
+                        if await _handle_models_command(command, config, f"{cli_channel}:{cli_chat_id}"):
+                            continue
+
                         turn_done.clear()
                         turn_response.clear()
                         renderer = StreamRenderer(render_markdown=markdown)
+
+                        # Check if session has temp_model override
+                        from nanobot.session.manager import SessionManager
+                        session_mgr = SessionManager(config.workspace_path)
+                        session = session_mgr.get_or_create(f"{cli_channel}:{cli_chat_id}")
+                        metadata = {"_wants_stream": True}
+                        if session and session.metadata.get("temp_model"):
+                            metadata["_temp_model"] = session.metadata["temp_model"]
 
                         await bus.publish_inbound(InboundMessage(
                             channel=cli_channel,
                             sender_id="user",
                             chat_id=cli_chat_id,
                             content=user_input,
-                            metadata={"_wants_stream": True},
+                            metadata=metadata,
                         ))
 
                         await turn_done.wait()
