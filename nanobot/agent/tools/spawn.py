@@ -13,6 +13,10 @@ if TYPE_CHECKING:
     tool_parameters_schema(
         task=StringSchema("The task for the subagent to complete"),
         label=StringSchema("Optional short label for the task (for display)"),
+        model=StringSchema(
+            "Optional: override the default subagent model (e.g., 'nine_router/combo-claw'). "
+            "If not provided, uses the model configured in subagent_model config."
+        ),
         required=["task"],
     )
 )
@@ -45,11 +49,18 @@ class SpawnTool(Tool):
             "and use a dedicated subdirectory when helpful."
         )
 
-    async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
+    async def execute(
+        self,
+        task: str,
+        label: str | None = None,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> str:
         """Spawn a subagent to execute the given task."""
         return await self._manager.spawn(
             task=task,
             label=label,
+            model=model,
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,

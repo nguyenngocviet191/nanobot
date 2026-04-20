@@ -49,6 +49,7 @@ class SubagentManager:
         bus: MessageBus,
         max_tool_result_chars: int,
         model: str | None = None,
+        subagent_model: str | None = None,
         web_config: "WebToolsConfig | None" = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
@@ -58,7 +59,8 @@ class SubagentManager:
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
-        self.model = model or provider.get_default_model()
+        # Model priority: subagent_model (config) > model (legacy) > provider default
+        self.model = subagent_model or model or provider.get_default_model()
         self.web_config = web_config or WebToolsConfig()
         self.max_tool_result_chars = max_tool_result_chars
         self.exec_config = exec_config or ExecToolConfig()
@@ -71,17 +73,27 @@ class SubagentManager:
         self,
         task: str,
         label: str | None = None,
+        model: str | None = None,
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
     ) -> str:
-        """Spawn a subagent to execute a task in the background."""
+        """Spawn a subagent to execute a task in the background.
+
+        Args:
+            task: The task description
+            label: Optional short label for display
+            model: Optional model override (e.g., 'nine_router/combo-claw')
+            origin_channel: Channel where spawn was called
+            origin_chat_id: Chat ID where spawn was called
+            session_key: Session key for tracking
+        """
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent(task_id, task, display_label, origin, model)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -96,7 +108,7 @@ class SubagentManager:
 
         bg_task.add_done_callback(_cleanup)
 
-        logger.info("Spawned subagent [{}]: {}", task_id, display_label)
+        logger.info("Spawned subagent [{}]: {} with model: {}", task_id, display_label, model or self.model)
         return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
 
     async def _run_subagent(
@@ -105,9 +117,20 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        model: str | None = None,
     ) -> None:
-        """Execute the subagent task and announce the result."""
-        logger.info("Subagent [{}] starting task: {}", task_id, label)
+        """Execute the subagent task and announce the result.
+
+        Args:
+            task_id: Unique task identifier
+            task: The task description
+            label: Display label
+            origin: Origin channel/chat info
+            model: Optional model override (overrides SubagentManager default)
+        """
+        # Use provided model or fall back to SubagentManager default
+        effective_model = model or self.model
+        logger.info("Subagent [{}] starting task: {} with model: {}", task_id, label, effective_model)
 
         try:
             # Build subagent tools (no message tool, no spawn tool)
@@ -140,7 +163,7 @@ class SubagentManager:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=messages,
                 tools=tools,
-                model=self.model,
+                model=effective_model,
                 max_iterations=15,
                 max_tool_result_chars=self.max_tool_result_chars,
                 hook=_SubagentHook(task_id),
