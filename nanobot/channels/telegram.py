@@ -320,10 +320,10 @@ class TelegramChannel(BaseChannel):
         )
         self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
 
-        # /models command handler - show provider/model selection inline keyboard
+        # /models command handler - show provider/model selection inline keyboard OR direct model selection
         self._app.add_handler(
             MessageHandler(
-                filters.Regex(r"^/models(?:@\w+)?(?:\s+.*)?$"),
+                filters.Regex(r"^/models(?:@\w+)?(?:\s+(.+))?"),
                 self._on_models_command,
             )
         )
@@ -1190,17 +1190,29 @@ User args: {args}"""
     }
 
     async def _on_models_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /models command - show provider selection inline keyboard."""
+        """Handle /models command - inline keyboard OR direct model selection."""
         if not update.message:
             return
 
+        # Extract model argument from command
+        match = re.match(r"^/models(?:@\w+)?(?:\s+(.+))?$", update.message.text or "")
+        model_arg = match.group(1) if match else None
+
+        # Direct model selection: /models <provider>/<model>
+        if model_arg and "/" in model_arg:
+            model_arg = model_arg.strip()
+            # Validate model format
+            if await self._validate_and_apply_model(update.message, model_arg):
+                return  # Success - reply sent inside validation
+            return  # Invalid model - reply already sent
+
+        # Show inline keyboard for provider/model selection
         providers = self._get_configured_providers()
 
         if not providers:
             await update.message.reply_text("⚠️ No providers configured.")
             return
 
-        # Build provider buttons (one per row for simplicity)
         buttons = [
             [InlineKeyboardButton(p["label"], callback_data=f"mdl:prov:{p['name']}")]
             for p in providers
@@ -1212,6 +1224,42 @@ User args: {args}"""
             parse_mode="Markdown",
             reply_markup=keyboard,
         )
+
+    async def _validate_and_apply_model(self, message: Message, model_full: str) -> bool:
+        """Validate and apply model directly from /models <provider>/<model> command.
+
+        Returns True if model was valid and applied, False otherwise.
+        """
+        parts = model_full.split("/")
+        if len(parts) < 2:
+            await message.reply_text(f"⚠️ Invalid format. Use: `/models <provider>/<model>`\nExample: `/models nine_router/glm-5`")
+            return False
+
+        provider_name = parts[0]
+        model_name = "/".join(parts[1:])  # Handle models like "custom/glm/glm-5"
+        session_key = str(message.chat_id)
+
+        # Check if provider is configured
+        providers = self._get_configured_providers()
+        provider_config = next((p for p in providers if p["name"] == provider_name), None)
+
+        if not provider_config:
+            available = ", ".join(p["name"] for p in providers)
+            await message.reply_text(f"⚠️ Unknown provider: `{provider_name}`\nAvailable: {available}")
+            return False
+
+        # Apply model to session
+        self._session_models[session_key] = model_full
+
+        # Update session metadata
+        chat_id = str(message.chat_id)
+        session = self._bus.sessions.get(chat_id)
+        if session:
+            session.metadata["temp_model"] = model_name
+            session.metadata["temp_provider"] = provider_name
+
+        await message.reply_text(f"✅ *Model updated*\n\nProvider: `{provider_name}`\nModel: `{model_name}`\n\nUse `/models` to change.", parse_mode="Markdown")
+        return True
 
     async def _on_callback_query(self, update: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle inline button callback queries for /models flow."""
