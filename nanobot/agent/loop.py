@@ -703,6 +703,19 @@ class AgentLoop:
                 self.sessions.save(session)
                 logger.info("Session {} model updated to {}", key, temp_model)
 
+        # Handle vision model override for images
+        vision_models = msg.metadata.get("_vision_model")
+        if vision_models:
+            # Store original model for restoration after vision processing
+            if "temp_model" not in session.metadata:
+                original_model = session.metadata.get("temp_model") or self.model
+                session.metadata["_original_model_before_vision"] = original_model
+            # Set vision model as temp model
+            session.metadata["temp_model"] = vision_models[0]
+            session.metadata["_vision_fallback"] = vision_models[1] if len(vision_models) > 1 else None
+            self.sessions.save(session)
+            logger.info("Image detected, switching to vision model: {}", vision_models[0])
+
         session, pending = self.auto_compact.prepare_session(session, key)
 
         # Slash commands

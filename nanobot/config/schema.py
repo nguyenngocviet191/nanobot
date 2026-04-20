@@ -84,6 +84,7 @@ class AgentDefaults(Base):
         serialization_alias="idleCompactAfterMinutes",
     )  # Auto-compact idle threshold in minutes (0 = disabled)
     show_token_usage: bool = False  # append token usage IN/OUT at the end of each response
+    vision_model: list[str] = Field(default_factory=list)  # [primary_vision_model, fallback_vision_model]
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
 

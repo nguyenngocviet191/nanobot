@@ -883,6 +883,13 @@ class TelegramChannel(BaseChannel):
             return {**metadata, "_temp_model": temp_model}
         return metadata
 
+    def _get_vision_models(self) -> list[str]:
+        """Get configured vision models from config."""
+        vision_models = []
+        if hasattr(self.config, "vision_model") and self.config.vision_model:
+            vision_models = [m for m in self.config.vision_model if m]
+        return vision_models
+
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
         if not update.message or not update.effective_user:
@@ -1016,6 +1023,13 @@ User args: {args}"""
         str_chat_id = str(chat_id)
         session_key = self._derive_topic_session_key(message)
         metadata = self._enrich_metadata_with_model(self._build_message_metadata(message, user), str_chat_id, session_key)
+
+        # Auto-switch to vision model for images
+        if media_paths and any(p.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')) for p in media_paths):
+            vision_models = self._get_vision_models()
+            if vision_models:
+                metadata["_vision_model"] = vision_models
+                logger.info("Image detected, switching to vision model: {}", vision_models[0])
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
         if media_group_id := getattr(message, "media_group_id", None):
