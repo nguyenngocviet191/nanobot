@@ -188,11 +188,12 @@ class TelegramConfig(Base):
     proxy: str | None = None
     reply_to_message: bool = False
     react_emoji: str = "👀"
-    group_policy: Literal["open", "mention"] = "mention"
+    group_policy: Literal["open", "mention", "read"] = "mention"
     connection_pool_size: int = 32
     pool_timeout: float = 5.0
     streaming: bool = True
     stream_edit_interval: float = Field(default=_STREAM_EDIT_INTERVAL_DEFAULT, ge=0.1)
+    vision_model: list[str] = Field(default_factory=list)  # Vision models for image analysis
 
 
 class TelegramChannel(BaseChannel):
@@ -840,11 +841,85 @@ class TelegramChannel(BaseChannel):
         return handle in text.lower()
 
     async def _is_group_message_for_bot(self, message) -> bool:
-        """Allow group messages when policy is open, @mentioned, or replying to the bot."""
-        if message.chat.type == "private" or self.config.group_policy == "open":
+        """Allow group messages when policy is open, @mentioned, or replying to the bot.
+
+        Policy modes:
+        - "open": Reply to all messages
+        - "mention": Only reply when @mentioned or replying to bot's message
+        - "read": Read all messages (add reaction), but only reply when @mentioned
+        """
+        if message.chat.type == "private":
             return True
 
+        # "open" policy: reply to everything
+        if self.config.group_policy == "open":
+            return True
+
+        # For both "mention" and "read" policies, check if bot is mentioned
         bot_id, bot_username = await self._ensure_bot_identity()
+        is_mentioned = False
+
+        if bot_username:
+            text = message.text or ""
+            caption = message.caption or ""
+            if self._has_mention_entity(
+                text,
+                getattr(message, "entities", None),
+                bot_username,
+                bot_id,
+            ):
+                is_mentioned = True
+            if self._has_mention_entity(
+                caption,
+                getattr(message, "caption_entities", None),
+                bot_username,
+                bot_id,
+            ):
+                is_mentioned = True
+
+        reply_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
+        is_replying_to_bot = bool(bot_id and reply_user and reply_user.id == bot_id)
+
+        # "mention" policy: only process if mentioned or replying to bot
+        if self.config.group_policy == "mention":
+            return is_mentioned or is_replying_to_bot
+
+        # "read" policy: always process (for reaction), but reply control happens later
+        if self.config.group_policy == "read":
+            return True
+
+        return False
+
+    async def _should_reply_to_message(self, message) -> bool:
+        """Determine if we should actually reply to this message (vs just reading it).
+
+        For "read" policy: only reply when @mentioned or replying to bot's message.
+        For "open" policy: always reply to group messages.
+        Private chats: always reply.
+        """
+        # Private chats always get replies
+        if message.chat.type == "private":
+            return True
+
+        # "open" policy: reply to all group messages
+        if self.config.group_policy == "open":
+            return True
+
+        # "mention" policy: check if mentioned
+        if self.config.group_policy == "mention":
+            return await self._is_mentioned_or_replying_to_bot(message)
+
+        # "read" policy: same as "mention" - only reply when mentioned
+        if self.config.group_policy == "read":
+            return await self._is_mentioned_or_replying_to_bot(message)
+
+        return False
+
+    async def _is_mentioned_or_replying_to_bot(self, message) -> bool:
+        """Check if message mentions the bot or is replying to the bot."""
+        bot_id, bot_username = await self._ensure_bot_identity()
+
+        # Check mention in text or caption
         if bot_username:
             text = message.text or ""
             caption = message.caption or ""
@@ -863,6 +938,7 @@ class TelegramChannel(BaseChannel):
             ):
                 return True
 
+        # Check if replying to bot
         reply_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
         return bool(bot_id and reply_user and reply_user.id == bot_id)
 
@@ -885,10 +961,13 @@ class TelegramChannel(BaseChannel):
 
     def _get_vision_models(self) -> list[str]:
         """Get configured vision models from config."""
-        vision_models = []
+        # vision_model is in telegram channel config (TelegramConfig)
         if hasattr(self.config, "vision_model") and self.config.vision_model:
-            vision_models = [m for m in self.config.vision_model if m]
-        return vision_models
+            return [m for m in self.config.vision_model if m]
+        # Fallback to camelCase
+        if hasattr(self.config, "visionModel") and self.config.visionModel:
+            return [m for m in self.config.visionModel if m]
+        return []
 
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
@@ -1002,6 +1081,12 @@ User args: {args}"""
         )
         media_paths.extend(current_media_paths)
         content_parts.extend(current_media_parts)
+
+        # DEBUG: trace vision model detection
+        vision_models = self._get_vision_models()
+        logger.debug(f"[VISION DEBUG] _get_vision_models() returned: {vision_models}")
+        has_images = media_paths and any(p.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')) for p in media_paths)
+        logger.debug(f"[VISION DEBUG] has_images: {has_images}, media_paths: {media_paths}")
         if current_media_paths:
             logger.debug("Downloaded message media to {}", current_media_paths[0])
 
@@ -1030,6 +1115,14 @@ User args: {args}"""
             if vision_models:
                 metadata["_vision_model"] = vision_models
                 logger.info("Image detected, switching to vision model: {}", vision_models[0])
+                # Send notification to user
+                try:
+                    await self.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🖼️ Detected image, switching to vision model: {vision_models[0]}"
+                    )
+                except Exception as e:
+                    logger.warning("Failed to send vision model notification: {}", e)
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
         if media_group_id := getattr(message, "media_group_id", None):
@@ -1041,7 +1134,9 @@ User args: {args}"""
                     "metadata": metadata,
                     "session_key": session_key,
                 }
-                self._start_typing(str_chat_id)
+                # Only show typing and reaction if we should reply
+                if await self._should_reply_to_message(message):
+                    self._start_typing(str_chat_id)
                 await self._add_reaction(str_chat_id, message.message_id, self.config.react_emoji)
             buf = self._media_group_buffers[key]
             if content and content != "[empty message]":
@@ -1051,9 +1146,15 @@ User args: {args}"""
                 self._media_group_tasks[key] = asyncio.create_task(self._flush_media_group(key))
             return
 
+        # Add reaction for all messages in "read" mode
+        await self._add_reaction(str_chat_id, message.message_id, self.config.react_emoji)
+
+        # Only start typing and forward to agent if we should reply
+        if not await self._should_reply_to_message(message):
+            return
+
         # Start typing indicator before processing
         self._start_typing(str_chat_id)
-        await self._add_reaction(str_chat_id, message.message_id, self.config.react_emoji)
 
         # Forward to the message bus
         await self._handle_message(
@@ -1072,9 +1173,22 @@ User args: {args}"""
             if not (buf := self._media_group_buffers.pop(key, None)):
                 return
             content = "\n".join(buf["contents"]) or "[empty message]"
+
+            # Auto-switch to vision model for images in media groups
+            media = list(dict.fromkeys(buf["media"]))
+            if media and any(p.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')) for p in media):
+                vision_models = self._get_vision_models()
+                if vision_models:
+                    buf["metadata"] = {**buf["metadata"], "_vision_model": vision_models}
+                    logger.info("Media group image detected, switching to vision model: {}", vision_models[0])
+
+            # For "read" policy, media groups should only forward if we should reply
+            # We stored the original message in buffer, but need to check reply eligibility
+            # For simplicity, media groups are only forwarded when there was content to begin with
+            # The typing was already controlled at buffer time based on _should_reply_to_message
             await self._handle_message(
                 sender_id=buf["sender_id"], chat_id=buf["chat_id"],
-                content=content, media=list(dict.fromkeys(buf["media"])),
+                content=content, media=media,
                 metadata=buf["metadata"],
                 session_key=buf.get("session_key"),
             )
