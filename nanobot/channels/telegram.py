@@ -333,9 +333,10 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
 
         # Custom commands handler - catches slash commands not handled above
+        # Pattern supports: /cmd, /cmd args, /cmd@botname, /cmd@botname args
         self._app.add_handler(
             MessageHandler(
-                filters.Regex(r"^/[a-zA-Z0-9_]+(?:\s+.*)?$"),
+                filters.Regex(r"^/[a-zA-Z0-9_]+(?:@[a-zA-Z0-9_]+)?(?:\s+.*)?$"),
                 self._on_custom_command,
             )
         )
@@ -1009,9 +1010,11 @@ class TelegramChannel(BaseChannel):
         if not content.startswith("/"):
             return
 
-        # Extract command name
+        # Extract command name (strip @botname suffix if present)
         parts = content.strip("/").split()
         cmd_name = parts[0].lower()
+        if "@" in cmd_name:
+            cmd_name = cmd_name.split("@")[0]
 
         # Check if it's a custom command
         cmd_content = self._custom_commands.get_command_content(cmd_name)

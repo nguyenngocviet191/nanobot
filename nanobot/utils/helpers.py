@@ -399,6 +399,8 @@ def build_status_content(
     context_window_tokens: int,
     session_msg_count: int,
     context_tokens_estimate: int,
+    config_path: str = "",
+    workspace_path: str = "",
     search_usage_text: str | None = None,
 ) -> str:
     """Build a human-readable runtime status snapshot.
@@ -426,6 +428,8 @@ def build_status_content(
         token_line += f" ({cached * 100 // last_in}% cached)"
     lines = [
         f"\U0001f408 nanobot-sh v{version}",
+        f"\U0001f9e0 Config: {config_path}",
+        f"\U0001f4c1 Workspace: {workspace_path}",
         f"\U0001f9e0 Model: {model}",
         token_line,
         f"\U0001f4da Context: {ctx_used_str}/{ctx_total_str} ({ctx_pct}%)",
