@@ -10,7 +10,7 @@ from nanobot import __version__
 from nanobot.bus.events import OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.command.agents import cmd_agents
-from nanobot.config.loader import get_config_path, load_config
+from nanobot.config.loader import get_config_path
 from nanobot.utils.helpers import build_status_content
 from nanobot.utils.restart import set_restart_notice_to_env
 
@@ -77,13 +77,9 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     except Exception:
         pass  # Never let usage fetch break /status
 
-    # Get config and workspace paths
+    # Get config and workspace paths from actual runtime values
     config_path = str(get_config_path())
-    try:
-        config = load_config()
-        workspace_path = str(config.workspace_path)
-    except Exception:
-        workspace_path = "unknown"
+    workspace_path = str(loop.workspace)
 
     # Use session temp_model if set (from /models selection), otherwise loop.model
     display_model = session.metadata.get("temp_model") or loop.model
